@@ -1,0 +1,151 @@
+name: Publicar versión
+
+# Igual que AVD jump: cada cambio que llega a main publica una versión nueva en GitHub Releases
+# (1.1.1, 1.1.2…). La app instalada la detecta al abrirse y ofrece actualizar, sin perder datos.
+# Enlace fijo a la última versión: https://github.com/adrianvillarroeldelgado-max/AVD-FOOT/releases/latest/download/PieYGemelos.apk
+# El archivo VERSION fija los dos primeros números (1.1); el tercero es el número de publicación.
+on:
+  push:
+    branches: ["main"]
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publicar
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Versión
+        run: |
+          BASE="$(tr -d '[:space:]' < VERSION | cut -d. -f1-2)"
+          V="$BASE.${{ github.run_number }}"
+          echo "VERSION_NAME=$V" >> "$GITHUB_ENV"
+          # Minutos desde 2024 del último cambio: siempre sube (la v1.1 tenía el código 1).
+          echo "VERSION_CODE=$(( ($(git log -1 --format=%ct) - 1704067200) / 60 ))" >> "$GITHUB_ENV"
+          echo "TAG=v$V" >> "$GITHUB_ENV"
+          # Novedades: los cambios desde la versión anterior.
+          PREV="$(git describe --tags --abbrev=0 HEAD 2>/dev/null || true)"
+          if [ -n "$PREV" ]; then RANGE="$PREV..HEAD"; else RANGE="-5"; fi
+          git log $RANGE --no-merges --format='• %s' | head -15 > notes.txt
+          cat notes.txt
+
+      - name: Crear proyecto Android (Capacitor)
+        run: |
+          mkdir -p build/www
+          cp index.html build/www/
+          cd build
+          npm init -y > /dev/null
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          npx cap init "Pie y Gemelos" com.adrian.piegemelos --web-dir www
+          npx cap add android
+
+      - name: Añadir actualizador, icono y versión
+        run: |
+          pip install pillow
+          cp android-src/*.java build/android/app/src/main/java/com/adrian/piegemelos/
+          python - <<'PY'
+          import os, re, shutil
+          from PIL import Image
+          app = "build/android/app"
+          # Permisos y receptor del actualizador
+          mf = f"{app}/src/main/AndroidManifest.xml"
+          m = open(mf, encoding="utf-8").read()
+          if "REQUEST_INSTALL_PACKAGES" not in m:
+              m = m.replace("</manifest>", '    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />\n</manifest>')
+          if "android.permission.INTERNET" not in m:
+              m = m.replace("</manifest>", '    <uses-permission android:name="android.permission.INTERNET" />\n</manifest>')
+          m = m.replace("</application>", '        <receiver android:name=".UpdateReceiver" android:exported="false" />\n    </application>', 1)
+          open(mf, "w", encoding="utf-8").write(m)
+          # Versión
+          g = f"{app}/build.gradle"
+          s = open(g, encoding="utf-8").read()
+          s = re.sub(r"versionCode \d+", "versionCode " + os.environ["VERSION_CODE"], s)
+          s = re.sub(r'versionName "[^"]*"', 'versionName "' + os.environ["VERSION_NAME"] + '"', s)
+          open(g, "w", encoding="utf-8").write(s)
+          # Icono
+          res = f"{app}/src/main/res"
+          shutil.rmtree(f"{res}/mipmap-anydpi-v26", ignore_errors=True)
+          src = Image.open("icon.png").convert("RGBA")
+          for d, px in {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}.items():
+              for n in ("ic_launcher.png", "ic_launcher_round.png"):
+                  src.resize((px, px), Image.LANCZOS).save(f"{res}/mipmap-{d}/{n}")
+          PY
+          grep -E "versionCode|versionName" build/android/app/build.gradle
+          grep -E "INSTALL|INTERNET|UpdateReceiver" build/android/app/src/main/AndroidManifest.xml
+
+      - name: Compilar
+        working-directory: build/android
+        run: |
+          chmod +x gradlew
+          set -o pipefail
+          if ! ./gradlew assembleRelease --no-daemon --console=plain 2>&1 | tee gradle.log; then
+            # Muestra el error como anotación para leerlo sin abrir el registro completo.
+            msg=$(grep -E "error:|What went wrong|^> |Could not|FAILED" gradle.log | head -60 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=Error de compilación::$msg"
+            exit 1
+          fi
+
+      - name: Firmar y preparar archivos
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          IN=build/android/app/build/outputs/apk/release/app-release-unsigned.apk
+          mkdir -p dist
+          "$BT/zipalign" -f -p 4 "$IN" aligned.apk
+          "$BT/apksigner" sign --ks app.keystore --ks-pass pass:piegemelos --key-pass pass:piegemelos --out dist/PieYGemelos.apk aligned.apk
+          "$BT/apksigner" verify dist/PieYGemelos.apk
+          cp dist/PieYGemelos.apk "dist/PieYGemelos-$VERSION_NAME.apk"
+          # Lo consulta la app instalada para saber si hay una versión nueva.
+          python - <<'PY'
+          import json, os
+          notes = open("notes.txt", encoding="utf-8").read().strip()
+          json.dump({
+              "versionCode": int(os.environ["VERSION_CODE"]),
+              "versionName": os.environ["VERSION_NAME"],
+              "apk": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{os.environ['TAG']}/PieYGemelos-{os.environ['VERSION_NAME']}.apk",
+              "notes": notes,
+          }, open("dist/version.json", "w", encoding="utf-8"), ensure_ascii=False)
+          PY
+          cat dist/version.json
+          {
+            echo "**Descargar:** PieYGemelos.apk (abajo, en *Assets*). Si ya tienes la 1.1.x o posterior, la app avisa sola al abrirse."
+            echo
+            echo "**Novedades**"
+            cat notes.txt
+            echo
+            echo "Primera instalación: abre el APK en el teléfono y permite “Instalar apps desconocidas”."
+          } > release.md
+
+      - name: Publicar en GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Pie y Gemelos ${{ env.VERSION_NAME }}
+          files: |
+            dist/PieYGemelos.apk
+            dist/PieYGemelos-${{ env.VERSION_NAME }}.apk
+            dist/version.json
+          body_path: release.md
+          make_latest: true

@@ -443,6 +443,10 @@ function renderPlan(){
       <p>Si hay doble partido o el gemelo está cargado, convierte el martes en el día "moderado" y salta el jueves.</p>
       <p style="color:var(--muted)">Para: dolor punzante, hormigueo o dolor en el talón al levantarte → consulta a un fisioterapeuta.</p>
       <button class="reset" id="reset">Reiniciar checks de este día</button>
+      <div id="upd" style="display:none;margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+        <span id="appver" style="color:var(--muted);font-size:.85rem"></span>
+        <button class="reset" id="btnUpd" style="margin-left:6px">Buscar actualizaciones</button>
+      </div>
     </div>`;
 
   $("main").querySelectorAll("input[type=checkbox]").forEach(cb=>cb.onchange=()=>{
@@ -456,6 +460,18 @@ function renderPlan(){
   });
   $("main").querySelectorAll("[data-t]").forEach(b=>b.onclick=()=>toggleTimer(+b.dataset.t, week));
   $("reset").onclick=()=>{ store.set(key,{}); render(); };
+  showUpdater();
+}
+
+/* ---------- ACTUALIZACIONES (solo en el APK) ---------- */
+function updater(){ try{ return window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.AppUpdater; }catch(e){ return null; } }
+let appVersion = null;
+function showUpdater(){
+  const u = updater(); if(!u || !$("upd")) return;
+  $("upd").style.display = "";
+  const paint = () => { $("appver").textContent = appVersion ? `Versión ${appVersion}` : ""; };
+  if (appVersion) paint(); else u.info().then(r => { appVersion = r.version; paint(); }).catch(()=>{});
+  $("btnUpd").onclick = () => { u.check().catch(()=>{}); };
 }
 
 function renderCal(){
