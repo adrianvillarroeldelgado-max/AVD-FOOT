@@ -1,0 +1,81 @@
+name: Compilar APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Crear proyecto Android (Capacitor)
+        run: |
+          mkdir -p build/www
+          cp index.html build/www/
+          cd build
+          npm init -y
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          npx cap init "Pie y Gemelos" com.adrian.piegemelos --web-dir www
+          npx cap add android
+
+      - name: Poner icono y versión
+        run: |
+          pip install pillow
+          python - <<'PY'
+          from PIL import Image
+          import shutil
+          res = "build/android/app/src/main/res"
+          shutil.rmtree(f"{res}/mipmap-anydpi-v26", ignore_errors=True)
+          src = Image.open("icon.png").convert("RGBA")
+          for d, s in {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}.items():
+              for n in ("ic_launcher.png", "ic_launcher_round.png"):
+                  src.resize((s, s), Image.LANCZOS).save(f"{res}/mipmap-{d}/{n}")
+          PY
+          sed -i "s/versionCode 1$/versionCode ${{ github.run_number }}/; s/versionName \"1.0\"/versionName \"1.${{ github.run_number }}\"/" build/android/app/build.gradle
+          grep -E "versionCode|versionName" build/android/app/build.gradle
+
+      - name: Compilar
+        working-directory: build/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Firmar APK
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          IN=build/android/app/build/outputs/apk/release/app-release-unsigned.apk
+          "$BT/zipalign" -f -p 4 "$IN" aligned.apk
+          "$BT/apksigner" sign --ks app.keystore --ks-pass pass:piegemelos --key-pass pass:piegemelos --out PieYGemelos.apk aligned.apk
+          "$BT/apksigner" verify PieYGemelos.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PieYGemelos-apk
+          path: PieYGemelos.apk
+
+      - name: Publicar en Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.${{ github.run_number }}
+          name: Pie y Gemelos v1.${{ github.run_number }}
+          files: PieYGemelos.apk
+          make_latest: true
